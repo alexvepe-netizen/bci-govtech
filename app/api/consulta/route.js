@@ -1,82 +1,166 @@
 import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_KEY
-);
-
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
 export async function POST(req) {
   try {
-    const { pregunta } = await req.json();
+    const body = await req.json();
+    const { query } = body;
 
-    // 🔹 1. embedding
-    const emb = await openai.embeddings.create({
-      model: "text-embedding-3-small",
-      input: pregunta,
+    const supabase = createClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL,
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+      {
+        global: {
+          headers: {
+            Authorization: req.headers.get("Authorization") || "",
+          },
+        },
+      }
+    );
+
+    // 🔐 Usuario
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+
+    if (!user) {
+      return new Response(JSON.stringify({ error: "No autenticado" }), {
+        status: 401,
+      });
+    }
+
+    // 📊 Suscripción
+    const { data: sub } = await supabase
+      .schema("core")
+      .from("suscripciones")
+      .select("*")
+      .eq("user_id", user.id)
+      .single();
+
+    if (!sub || sub.estado !== "activo") {
+      return new Response(JSON.stringify({ error: "Sin acceso" }), {
+        status: 403,
+      });
+    }
+
+    const openai = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY,
     });
 
-    const vector = emb.data[0].embedding;
+    // 🔎 EMBEDDING
+    const embeddingResponse = await openai.embeddings.create({
+      model: "text-embedding-3-small",
+      input: query,
+    });
 
-    // 🔹 2. búsqueda
-    const { data } = await supabase
-      .schema("core")
-      .rpc("match_documents", {
-        query_embedding: vector,
-        match_count: 5,
-      });
+    const vector = embeddingResponse.data[0].embedding;
 
-    // 🔹 3. contexto
-    const contexto = data.map(d => `
-Fuente: ${d.fuente}
-Norma: ${d.norma}
-Capítulo: ${d.capitulo}
-Artículo: ${d.articulo}
-Texto: ${d.texto}
-`).join("\n---\n");
+    // 🔎 RAG - Supabase
+    const { data: docs, error } = await supabase.rpc("match_documents", {
+      query_embedding: vector,
+      match_count: 5,
+    });
 
-    // 🔹 4. prompt
-    const prompt = `
-Actúa como experto en compras públicas en Chile.
+    if (error) {
+      console.error(error);
+    }
 
-Responde en 3 partes:
+    if (!docs || docs.length === 0) {
+      return new Response(
+        JSON.stringify({
+          respuesta:
+            "No se encontró información suficiente en la base de datos.",
+        }),
+        { status: 200 }
+      );
+    }
 
-1. Resumen claro
-2. Fundamento legal con citas específicas
-3. Fuentes separadas
+    // 🧠 CONTEXTO
+    const contexto = docs
+      .map(
+        (d, i) => `
+Documento ${i + 1}:
+${d.texto}
+`
+      )
+      .join("\n");
 
-Reglas:
-- No inventar normativa
-- Si hay duda, indicarlo
-- Usa SOLO el contexto
+    // 🤖 IA (solo niveles 1 y 2)
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content: `Eres un abogado experto en compras públicas en Chile.
+
+Debes responder SOLO en este formato:
+
+RESPUESTA CLARA:
+...
+
+CONTEXTO:
+...
+
+No agregues fuentes.
+No inventes información.
+Usa solo el contexto.`,
+        },
+        {
+          role: "user",
+          content: `Pregunta:
+${query}
 
 Contexto:
-${contexto}
+${contexto}`,
+        },
+      ],
+    });
 
-Pregunta:
-${pregunta}
+    const respuestaIA = completion.choices[0].message.content;
+
+    // ✂️ Separar niveles IA
+    const parte1 = respuestaIA
+      .split("CONTEXTO:")[0]
+      .replace("RESPUESTA CLARA:", "")
+      .trim();
+
+    const parte2 = respuestaIA.split("CONTEXTO:")[1]?.trim() || "";
+
+    // 📚 NIVEL 3 (Supabase real)
+    const fuentes = docs
+      .map(
+        (d, i) => `
+Fuente ${i + 1}:
+Norma: ${d.norma}
+Fuente: ${d.fuente}
+Resumen: ${d.resumen || "Sin resumen disponible"}
+`
+      )
+      .join("\n");
+
+    // 🧾 RESPUESTA FINAL (FORMATO PRO)
+    const respuestaFinal = `
+1️⃣ RESPUESTA CLARA:
+${parte1}
+
+2️⃣ CONTEXTO:
+${parte2}
+
+3️⃣ FUENTES:
+${fuentes}
 `;
 
-    // 🔹 5. IA
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
-      messages: [
-        { role: "system", content: "Eres experto en compras públicas en Chile." },
-        { role: "user", content: prompt }
-      ],
-      temperature: 0.2,
-    });
-
-    return Response.json({
-      respuesta: completion.choices[0].message.content,
-    });
-
+    return new Response(
+      JSON.stringify({
+        respuesta: respuestaFinal,
+        documentos: docs,
+      }),
+      { status: 200 }
+    );
   } catch (err) {
     console.error(err);
-    return Response.json({ error: "Error interno" }, { status: 500 });
+    return new Response(JSON.stringify({ error: "Error interno" }), {
+      status: 500,
+    });
   }
 }
