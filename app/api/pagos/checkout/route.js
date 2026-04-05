@@ -33,8 +33,21 @@ export async function POST(req) {
         },
       ],
 
-      success_url: "http://localhost:3000/consulta?pago=ok",
-      cancel_url: "http://localhost:3000/consulta?pago=cancelado",
+      const baseUrl =
+      process.env.NEXT_PUBLIC_SITE_URL || req.headers.get("origin");
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ["card"],
+      mode: "subscription",
+      customer_email: email,
+      line_items: [
+        {
+          price: "price_xxx",
+          quantity: 1,
+        },
+      ],
+      success_url: `${baseUrl}/consulta`,
+      cancel_url: `${baseUrl}/consulta`,
     });
 
     return new Response(JSON.stringify({ url: session.url }), {
