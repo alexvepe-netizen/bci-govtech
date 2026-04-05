@@ -29,18 +29,67 @@ export async function POST(req) {
       });
     }
 
-    // 📊 Suscripción
-    const { data: sub } = await supabase
+    // 📊 SUSCRIPCIÓN + TRIAL
+    let { data: sub, error: subError } = await supabase
       .schema("core")
       .from("suscripciones")
       .select("*")
       .eq("user_id", user.id)
-      .single();
+      .maybeSingle();
 
-    if (!sub || sub.estado !== "activo") {
-      return new Response(JSON.stringify({ error: "Sin acceso" }), {
-        status: 403,
-      });
+    if (subError) {
+      console.error("Error suscripción:", subError);
+    }
+
+    // 🆕 Si no existe → crear trial automático
+    if (!sub) {
+      const ahora = new Date();
+      const fin = new Date();
+      fin.setDate(fin.getDate() + 7);
+
+      const { data: nuevaSub } = await supabase
+        .schema("core")
+        .from("suscripciones")
+        .insert({
+          user_id: user.id,
+          plan: "free",
+          consultas_usadas: 0,
+          trial_inicio: ahora.toISOString(),
+          trial_fin: fin.toISOString(),
+          estado: "trial",
+        })
+        .select()
+        .single();
+
+      sub = nuevaSub;
+    }
+
+    // 🧠 VALIDACIÓN
+    const ahora = new Date();
+    const finTrial = sub.trial_fin ? new Date(sub.trial_fin) : null;
+
+    // 🔴 CASO: FREE
+    if (sub.plan === "free") {
+      if (!finTrial || ahora > finTrial || (sub.consultas_usadas || 0) >= 5) {
+        return new Response(
+          JSON.stringify({
+            error: "TRIAL_FINALIZADO",
+            mensaje: "Tu periodo gratuito ha finalizado. Suscríbete para continuar.",
+          }),
+          { status: 403 }
+        );
+      }
+    }
+
+    // 🔵 CASO: PREMIUM
+    if (sub.plan === "premium" && sub.estado !== "activo") {
+      return new Response(
+        JSON.stringify({
+          error: "SIN_ACCESO",
+          mensaje: "Tu suscripción no está activa.",
+        }),
+        { status: 403 }
+      );
     }
 
     const openai = new OpenAI({
@@ -55,21 +104,24 @@ export async function POST(req) {
 
     const vector = embeddingResponse.data[0].embedding;
 
-    // 🔎 RAG - Supabase
-    const { data: docs, error } = await supabase.rpc("match_documents", {
-      query_embedding: vector,
-      match_count: 5,
-    });
+    // 🔎 RAG
+    const { data: docs, error } = await supabase
+      .schema("core")
+      .rpc("match_documents", {
+        query_embedding: vector,
+        match_count: 8,
+      });
 
     if (error) {
       console.error(error);
+      throw new Error("Error en RAG");
     }
 
     if (!docs || docs.length === 0) {
       return new Response(
         JSON.stringify({
-          respuesta:
-            "No se encontró información suficiente en la base de datos.",
+          respuesta: "No se encontró información suficiente en la base jurídica.",
+          fuentes: [],
         }),
         { status: 200 }
       );
@@ -80,30 +132,47 @@ export async function POST(req) {
       .map(
         (d, i) => `
 Documento ${i + 1}:
+Norma: ${d.norma}
+Fuente: ${d.fuente}
+Artículo: ${d.articulo || "No especificado"}
+Resumen: ${d.resumen || "No disponible"}
+
+Contenido:
 ${d.texto}
 `
       )
       .join("\n");
 
-    // 🤖 IA (solo niveles 1 y 2)
+    // 🤖 IA
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
+      temperature: 0.2,
       messages: [
         {
           role: "system",
           content: `Eres un abogado experto en compras públicas en Chile.
 
-Debes responder SOLO en este formato:
+Debes responder SIEMPRE en este formato exacto:
 
-RESPUESTA CLARA:
-...
+RESPUESTA:
+Texto claro y directo (máx 5 líneas)
 
-CONTEXTO:
-...
+FUNDAMENTO:
+Explicación jurídica basada en normativa
 
-No agregues fuentes.
-No inventes información.
-Usa solo el contexto.`,
+RECOMENDACIÓN PRÁCTICA:
+Pasos concretos aplicables
+
+REGLAS:
+- NO usar emojis
+- NO usar ###
+- NO cambiar los títulos
+- NO agregar secciones adicionales
+- NO repetir títulos
+- NO incluir "CONTEXTO NORMATIVO"
+- SOLO usar RESPUESTA, FUNDAMENTO y RECOMENDACIÓN PRÁCTICA
+
+`,
         },
         {
           role: "user",
@@ -116,51 +185,82 @@ ${contexto}`,
       ],
     });
 
-    const respuestaIA = completion.choices[0].message.content;
+    const respuestaIA = completion.choices?.[0]?.message?.content || "";
 
-    // ✂️ Separar niveles IA
-    const parte1 = respuestaIA
-      .split("CONTEXTO:")[0]
-      .replace("RESPUESTA CLARA:", "")
-      .trim();
+    if (!respuestaIA) {
+      throw new Error("OpenAI no devolvió respuesta");
+    }
 
-    const parte2 = respuestaIA.split("CONTEXTO:")[1]?.trim() || "";
+    // ✂️ SEPARAR RESPUESTA
 
-    // 📚 NIVEL 3 (Supabase real)
-    const fuentes = docs
-      .map(
-        (d, i) => `
-Fuente ${i + 1}:
-Norma: ${d.norma}
-Fuente: ${d.fuente}
-Resumen: ${d.resumen || "Sin resumen disponible"}
-`
-      )
-      .join("\n");
 
-    // 🧾 RESPUESTA FINAL (FORMATO PRO)
-    const respuestaFinal = `
-1️⃣ RESPUESTA CLARA:
-${parte1}
+    // 📚 FUENTES
+    const fuentes = docs.map((d, i) => ({
+      numero: i + 1,
+      norma: d.norma,
+      fuente: d.fuente,
+      articulo: d.articulo,
+      resumen: d.resumen,
+      url: d.url || null,
+    }));
 
-2️⃣ CONTEXTO:
-${parte2}
+    // 🧾 RESPUESTA FINAL
+   const respuestaFinal = respuestaIA;
 
-3️⃣ FUENTES:
-${fuentes}
-`;
+    // 💾 GUARDAR HISTORIAL
+    const { error: insertError } = await supabase
+      .schema("core")
+      .from("historial_consultas")
+      .insert({
+        user_id: user.id,
+        pregunta: query,
+        respuesta: respuestaFinal,
+      });
 
+    if (insertError) {
+      console.error("Error guardando historial:", insertError);
+    }
+
+    // ➕ SUMAR USO SOLO SI TODO OK
+    let updateError = null;
+
+    if (!insertError) {
+      const res = await supabase
+        .schema("core")
+        .from("suscripciones")
+        .update({
+          consultas_usadas: ((sub?.consultas_usadas) || 0) + 1,
+        })
+        .eq("user_id", user.id);
+
+      updateError = res.error;
+
+      if (updateError) {
+        console.error("Error actualizando uso:", updateError);
+      }
+    }
+
+    // 🧠 LOG PRO
+    console.log({
+      historial: insertError ? "ERROR" : "OK",
+      uso: updateError ? "ERROR" : "OK",
+    });
+
+    // 📤 RESPUESTA
     return new Response(
       JSON.stringify({
         respuesta: respuestaFinal,
         documentos: docs,
+        fuentes,
       }),
       { status: 200 }
     );
+
   } catch (err) {
     console.error(err);
-    return new Response(JSON.stringify({ error: "Error interno" }), {
-      status: 500,
-    });
+    return new Response(
+      JSON.stringify({ error: "Error interno del servidor" }),
+      { status: 500 }
+    );
   }
 }
